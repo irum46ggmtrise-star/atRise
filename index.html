@@ -1,0 +1,809 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EC育成マニュアル・インタラクティブダッシュボード</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Firebase Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection, query } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // Firestoreログレベルをデバッグに設定
+        setLogLevel('Debug');
+
+        // グローバル変数（Canvas環境から提供されるもの）
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db, auth, userId = null;
+        window.isAuthReady = false;
+
+        if (firebaseConfig) {
+            const app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+            window.db = db;
+            window.auth = auth;
+        } else {
+             console.error("Firebase config is missing. Data persistence will not work.");
+        }
+
+        async function authenticateAndLoad() {
+            try {
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Firebase Authentication failed:", error);
+            }
+
+            onAuthStateChanged(auth, (user) => {
+                if (user) {
+                    userId = user.uid;
+                    window.userId = userId;
+                    window.isAuthReady = true;
+                    console.log(`Authenticated as user: ${userId}`);
+                    window.loadTasks(); 
+                } else {
+                    // 認証されていない場合は匿名サインインを試みる（上記で既に実行済みだが、念のため）
+                    if (!auth.currentUser) {
+                         console.log("No authenticated user, attempting anonymous sign in if not already done.");
+                         window.loadTasks(); // 認証なしでも読み込みを試みる (空のデータがロードされる)
+                    }
+                }
+            });
+        }
+
+        // Firestoreへのデータ保存ロジック
+        window.saveTaskProgress = async (taskId, employee, key, value) => {
+            if (!window.isAuthReady || !window.db || !window.userId) {
+                console.warn("Firestore not ready. Cannot save data.");
+                return;
+            }
+
+            const docRef = doc(window.db, `artifacts/${appId}/users/${window.userId}/ec_tasks`, taskId);
+            
+            try {
+                await setDoc(docRef, { 
+                    [key]: value,
+                    timestamp: new Date().toISOString()
+                }, { merge: true });
+                // console.log(`Document written for ${taskId}`);
+            } catch (e) {
+                console.error("Error adding document: ", e);
+            }
+        };
+
+        // Firestoreからのデータ読み込みロジック (onSnapshotでリアルタイム監視)
+        window.loadTasks = () => {
+            if (!window.isAuthReady || !window.db || !window.userId) {
+                console.warn("Firestore not ready. Loading static data only.");
+                window.populateTaskTable();
+                window.renderProgressCharts();
+                return;
+            }
+
+            const taskColRef = collection(window.db, `artifacts/${appId}/users/${window.userId}/ec_tasks`);
+            
+            onSnapshot(taskColRef, (snapshot) => {
+                const firestoreDataMap = {};
+                snapshot.forEach(doc => {
+                    firestoreDataMap[doc.id] = doc.data();
+                });
+                
+                // 静的データにFirestoreデータをマージ
+                window.allTasks = window.allTasks.map(task => {
+                    const saved = firestoreDataMap[task.id];
+                    if (saved) {
+                        return {
+                            ...task,
+                            checkedA: saved.checkedA !== undefined ? saved.checkedA : task.checkedA,
+                            dateA: saved.dateA !== undefined ? saved.dateA : task.dateA,
+                            checkedB: saved.checkedB !== undefined ? saved.checkedB : task.checkedB,
+                            dateB: saved.dateB !== undefined ? saved.dateB : task.dateB,
+                        };
+                    }
+                    return task;
+                });
+                
+                // UIとチャートを更新
+                window.populateTaskTable();
+                window.renderProgressCharts();
+                // console.log("Tasks loaded and UI updated from Firestore.");
+            }, (error) => {
+                console.error("Error listening to Firestore:", error);
+            });
+        };
+
+        document.addEventListener('DOMContentLoaded', authenticateAndLoad);
+    </script>
+    <!-- Chosen Palette: Calm Harmony (Stone, Blue, with Green/Yellow/Red accents) -->
+    <style>
+        body {
+            font-family: 'Inter', 'Noto Sans JP', sans-serif;
+        }
+        .chart-container {
+            position: relative;
+            width: 100%;
+            max-width: 300px;
+            margin-left: auto;
+            margin-right: auto;
+            height: 300px;
+            max-height: 300px;
+        }
+        .bar-chart-container {
+            position: relative;
+            width: 100%;
+            max-width: 500px;
+            margin-left: auto;
+            margin-right: auto;
+            height: 250px;
+            max-height: 250px;
+        }
+        .radar-chart-container {
+            position: relative;
+            width: 100%;
+            max-width: 400px;
+            margin-left: auto;
+            margin-right: auto;
+            height: 350px;
+            max-height: 350px;
+        }
+        [data-view] { display: none; }
+        [data-view].active { display: block; }
+        [data-tab-content] { display: none; }
+        [data-tab-content].active { display: block; }
+        .nav-link {
+            cursor: pointer;
+            padding: 0.5rem 1rem;
+            border-radius: 0.375rem;
+            transition: background-color 0.2s;
+        }
+        .nav-link.active {
+            background-color: #1d4ed8;
+            color: white;
+        }
+        .nav-link:not(.active):hover {
+            background-color: #eff6ff;
+        }
+        .tab-link {
+            cursor: pointer;
+            padding: 0.5rem 1rem;
+            border-bottom: 2px solid transparent;
+            transition: border-color 0.2s, color 0.2s;
+        }
+        .tab-link.active {
+            border-color: #1d4ed8;
+            color: #1d4ed8;
+            font-weight: 600;
+        }
+        .tab-link:not(.active):hover {
+            color: #3b82f6;
+        }
+    </style>
+</head>
+<body class="bg-stone-50 text-stone-800">
+
+    <div class="container mx-auto p-4 md:p-8 max-w-7xl">
+
+        <header class="mb-8">
+            <h1 class="text-3xl md:text-4xl font-bold text-blue-800 mb-2">EC育成マニュアル・ダッシュボード</h1>
+            <p class="text-lg text-stone-600">社員Aさん・Bさんの成長ロードマップと進捗管理</p>
+        </header>
+
+        <nav class="flex flex-wrap gap-2 md:gap-4 items-center bg-white p-4 rounded-lg shadow-sm mb-8">
+            <span class="text-sm font-semibold text-stone-500 uppercase mr-2">ビュー切替:</span>
+            <a id="nav-roadmap" class="nav-link active" onclick="showView('roadmap')">全体ロードマップ</a>
+            <a id="nav-progress" class="nav-link" onclick="showView('progress')">担当者別進捗</a>
+            <a id="nav-skills" class="nav-link" onclick="showView('skills')">等級別スキル</a>
+        </nav>
+
+        <main>
+            <!-- View 1: 全体ロードマップ -->
+            <section id="view-roadmap" data-view class="active">
+                <div class="bg-white p-6 rounded-lg shadow-sm mb-6">
+                    <h2 class="text-2xl font-bold text-blue-700 mb-3">ようこそ！</h2>
+                    <p class="text-stone-600 leading-relaxed">
+                        このダッシュボードは、EC担当者としての成長をサポートするためのインタラクティブなマニュアルです。
+                        「全体ロードマップ」で1年間の育成計画の全体像を把握し、「担当者別進捗」で日々のタスクと進捗を確認、「等級別スキル」で各等級（J1〜J3）で求められる能力を深く理解することができます。
+                    </p>
+                </div>
+                
+                <h2 class="text-2xl font-bold text-stone-700 mb-4">育成計画と目標等級</h2>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                    <div class="bg-white p-6 rounded-lg shadow-md border-l-4 border-green-500">
+                        <span class="block text-sm font-semibold text-green-600">4月～6月</span>
+                        <h3 class="text-2xl font-bold text-green-700 my-2">目標等級: J1</h3>
+                        <p class="text-stone-600">
+                            <strong>達成状態:</strong> 販売のベースルーティンの意図を理解して作業としてできる考え方が染みついている。
+                        </p>
+                    </div>
+                    <div class="bg-white p-6 rounded-lg shadow-md border-l-4 border-yellow-500">
+                        <span class="block text-sm font-semibold text-yellow-600">7月～翌3月</span>
+                        <h3 class="text-2xl font-bold text-yellow-700 my-2">目標等級: J2</h3>
+                        <p class="text-stone-600">
+                            <strong>達成状態:</strong> データに基づきKGI/KPIを設定し、実行可能な改善施策を立案・実行し、成果を出せる状態。
+                        </p>
+                    </div>
+                    <div class="bg-white p-6 rounded-lg shadow-md border-l-4 border-red-500">
+                        <span class="block text-sm font-semibold text-red-600">翌4月～翌6月</span>
+                        <h3 class="2xl font-bold text-red-700 my-2">目標等級: J3</h3>
+                        <p class="text-stone-600">
+                            <strong>達成状態:</strong> 担当カテゴリ/ブランドの売上・利益最大化に向けた計画策定と実行、および事業に貢献する商品開発プロセスへの参画ができる状態。
+                        </p>
+                    </div>
+                </div>
+
+                <h2 class="text-2xl font-bold text-stone-700 mt-10 mb-6">J1-J3 成長タイムライン</h2>
+                <div class="bg-white p-6 rounded-lg shadow-sm">
+                    <div class="relative w-full overflow-x-auto">
+                        <div class="flex items-center" style="width: 1200px;">
+                            <div class="flex flex-col text-center border-r-2 border-gray-200 pr-4">
+                                <span class="font-semibold">4月</span>
+                                <span class="text-sm">Apr</span>
+                            </div>
+                            <div class="w-1/4 bg-green-100 rounded-l-full h-10 flex items-center justify-center">
+                                <span class="font-semibold text-green-800">J1</span>
+                            </div>
+                            <div class="w-1/4 bg-green-100 h-10"></div>
+                            <div class="w-1/4 bg-green-100 rounded-r-full h-10 flex items-center justify-center relative">
+                                <span class="font-semibold text-green-800">J1</span>
+                                <div class="absolute right-0 top-1/2 -translate-y-1/2 transform translate-x-1/2">
+                                    <div class="flex flex-col text-center px-4">
+                                        <span class="font-semibold">6月</span>
+                                        <span class="text-sm">Jun</span>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div class="w-1/4 bg-yellow-100 rounded-l-full h-10 flex items-center justify-center relative">
+                                <span class="font-semibold text-yellow-800">J2</span>
+                                <div class="absolute left-0 top-1/2 -translate-y-1/2 transform -translate-x-1/2">
+                                    <div class="flex flex-col text-center px-4">
+                                        <span class="font-semibold">7月</span>
+                                        <span class="text-sm">Jul</span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="w-full bg-yellow-100 h-10"></div>
+                            <div class="w-1/4 bg-yellow-100 rounded-r-full h-10 flex items-center justify-center relative">
+                                <span class="font-semibold text-yellow-800">J2</span>
+                                <div class="absolute right-0 top-1/2 -translate-y-1/2 transform translate-x-1/2">
+                                    <div class="flex flex-col text-center px-4">
+                                        <span class="font-semibold">3月</span>
+                                        <span class="text-sm">Mar</span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="w-1/4 bg-red-100 rounded-l-full h-10 flex items-center justify-center relative">
+                                <span class="font-semibold text-red-800">J3</span>
+                                <div class="absolute left-0 top-1/2 -translate-y-1/2 transform -translate-x-1/2">
+                                    <div class="flex flex-col text-center px-4">
+                                        <span class="font-semibold">4月</span>
+                                        <span class="text-sm">Apr</span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="w-1/4 bg-red-100 h-10"></div>
+                            <div class="w-1/4 bg-red-100 rounded-r-full h-10 flex items-center justify-center relative">
+                                <span class="font-semibold text-red-800">J3</span>
+                                <div class="absolute right-0 top-1/2 -translate-y-1/2 transform translate-x-1/2">
+                                    <div class="flex flex-col text-center px-4">
+                                        <span class="font-semibold">6月</span>
+                                        <span class="text-sm">Jun</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- View 2: 担当者別進捗 -->
+            <section id="view-progress" data-view>
+                <div class="bg-white p-6 rounded-lg shadow-sm mb-6">
+                    <h2 class="text-2xl font-bold text-blue-700 mb-3">担当者別進捗</h2>
+                    <p class="text-stone-600 leading-relaxed">
+                        ここでは、担当者ごとの学習進捗を視覚的に確認できます。
+                        下の「実践チェックリスト」で各項目のチェックボックスを更新すると、上部のグラフがリアルタイムで変動し、データはクラウドに保存されます。
+                        日々の進捗管理とタスクの達成確認に活用してください。
+                    </p>
+                </div>
+
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
+                    <div class="bg-white p-6 rounded-lg shadow-md">
+                        <h3 class="text-xl font-semibold text-center mb-4">Aさんの進捗</h3>
+                        <div class="flex flex-col md:flex-row gap-4 items-center">
+                            <div class="chart-container">
+                                <canvas id="progressChartA"></canvas>
+                            </div>
+                            <div class="w-full">
+                                <h4 class="font-semibold mb-2">等級別進捗</h4>
+                                <div class="bar-chart-container !h-48 !max-h-48">
+                                    <canvas id="progressByGradeA"></canvas>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="bg-white p-6 rounded-lg shadow-md">
+                        <h3 class="text-xl font-semibold text-center mb-4">Bさんの進捗</h3>
+                        <div class="flex flex-col md:flex-row gap-4 items-center">
+                            <div class="chart-container">
+                                <canvas id="progressChartB"></canvas>
+                            </div>
+                            <div class="w-full">
+                                <h4 class="font-semibold mb-2">等級別進捗</h4>
+                                <div class="bar-chart-container !h-48 !max-h-48">
+                                    <canvas id="progressByGradeB"></canvas>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <h2 class="text-2xl font-bold text-stone-700 mb-4">実践チェックリスト</h2>
+                <div class="bg-white shadow-md rounded-lg overflow-x-auto">
+                    <table class="w-full min-w-[1200px] text-sm text-left text-stone-600">
+                        <thead class="text-xs text-stone-700 uppercase bg-stone-100">
+                            <tr>
+                                <th scope="col" class="px-4 py-3">月</th>
+                                <th scope="col" class="px-4 py-3">等級</th>
+                                <th scope="col" class="px-4 py-3">カテゴリ</th>
+                                <th scope="col" class="px-4 py-3 w-1/4">達成項目</th>
+                                <th scope="col" class="px-4 py-3 w-1/3">達成基準・解説</th>
+                                <th scope="col" class="px-4 py-3">Aさん</th>
+                                <th scope="col" class="px-4 py-3">Aさん日付</th>
+                                <th scope="col" class="px-4 py-3">Bさん</th>
+                                <th scope="col" class="px-4 py-3">Bさん日付</th>
+                            </tr>
+                        </thead>
+                        <tbody id="task-table-body">
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- View 3: 等級別スキル -->
+            <section id="view-skills" data-view>
+                <div class="bg-white p-6 rounded-lg shadow-sm mb-6">
+                    <h2 class="text-2xl font-bold text-blue-700 mb-3">等級別スキル</h2>
+                    <p class="text-stone-600 leading-relaxed">
+                        各等級（J1, J2, J3）で求められるスキルの全体像と、各カテゴリのバランスを確認します。
+                        レーダーチャートは、その等級でどの領域のスキルが重視されるかを示しています。
+                        下のリストで各達成項目の詳細を確認し、自身の強みと弱みを把握しましょう。
+                    </p>
+                </div>
+
+                <div class="border-b border-gray-200 mb-6">
+                    <nav class="flex -mb-px">
+                        <a class="tab-link active" onclick="showTab('j1')">J1 スキル</a>
+                        <a class="tab-link" onclick="showTab('j2')">J2 スキル</a>
+                        <a class="tab-link" onclick="showTab('j3')">J3 スキル</a>
+                    </nav>
+                </div>
+
+                <div id="tab-j1" data-tab-content class="active">
+                    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                        <div class="bg-white p-6 rounded-lg shadow-md">
+                            <h3 class="text-xl font-semibold mb-2 text-green-700">J1: 達成状態</h3>
+                            <p class="text-stone-600 mb-4">販売のベースルーティンの意図を理解して作業としてできる考え方が染みついている。</p>
+                            <h4 class="lg font-semibold mb-3">スキルカテゴリ</h4>
+                            <div class="radar-chart-container">
+                                <canvas id="skillRadarJ1"></canvas>
+                            </div>
+                        </div>
+                        <div class="bg-white p-6 rounded-lg shadow-md max-h-[500px] overflow-y-auto">
+                            <h3 class="text-xl font-semibold mb-4 text-green-700">J1 項目一覧</h3>
+                            <ul id="skillListJ1" class="space-y-4"></ul>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="tab-j2" data-tab-content>
+                    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                        <div class="bg-white p-6 rounded-lg shadow-md">
+                            <h3 class="text-xl font-semibold mb-2 text-yellow-700">J2: 達成状態</h3>
+                            <p class="text-stone-600 mb-4">データに基づきKGI/KPIを設定し、実行可能な改善施策を立案・実行し、成果を出せる状態。</p>
+                            <h4 class="text-lg font-semibold mb-3">スキルカテゴリ</h4>
+                            <div class="radar-chart-container">
+                                <canvas id="skillRadarJ2"></canvas>
+                            </div>
+                        </div>
+                        <div class="bg-white p-6 rounded-lg shadow-md max-h-[500px] overflow-y-auto">
+                            <h3 class="text-xl font-semibold mb-4 text-yellow-700">J2 項目一覧</h3>
+                            <ul id="skillListJ2" class="space-y-4"></ul>
+                        </div>
+                    </div>
+                </div>
+                
+                <div id="tab-j3" data-tab-content>
+                    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                        <div class="bg-white p-6 rounded-lg shadow-md">
+                            <h3 class="text-xl font-semibold mb-2 text-red-700">J3: 達成状態</h3>
+                            <p class="text-stone-600 mb-4">担当カテゴリ/ブランドの売上・利益最大化に向けた計画策定と実行、および事業に貢献する商品開発プロセスへの参画ができる状態。</p>
+                            <h4 class="text-lg font-semibold mb-3">スキルカテゴリ</h4>
+                            <div class="radar-chart-container">
+                                <canvas id="skillRadarJ3"></canvas>
+                            </div>
+                        </div>
+                        <div class="bg-white p-6 rounded-lg shadow-md max-h-[500px] overflow-y-auto">
+                            <h3 class="text-xl font-semibold mb-4 text-red-700">J3 項目一覧</h3>
+                            <ul id="skillListJ3" class="space-y-4"></ul>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script>
+        // NOTE: allTasksはマスターデータとして静的に保持し、Firestoreからの動的データをマージします。
+        window.allTasks = [
+            { id: 't1', month: '4月', grade: 'J1', category: 'I. 基礎・ルーティン業務', item: 'ルーティン業務', criteria: '店舗の売上データや他部署から見るデータの構造と、その重要性を理解し、日次/週次レポートの作成ができる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't2', month: '4月', grade: 'J1', category: 'II. 販売の基本思考', item: '販売担当の責任', criteria: '「会社に利益を残す」という責任を理解し、利益率、粗利という概念を説明できる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't3', month: '4月', grade: 'J1', category: 'I. 基礎・ルーティン業務', item: '商品登録、更新', criteria: '登録・更新作業のオペレーションを習得し、ミスなく行える。（意図：データ整合性の確保）', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't4', month: '5月', grade: 'J1', category: 'III. 利益と戦略', item: '商品の販売方法', criteria: '「売上＝アクセス数×転換率×客単価」の方程式を説明し、それぞれ何を行えば改善できるか3つ以上挙げられる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't5', month: '5月', grade: 'J1', category: 'III. 利益と戦略', item: '商品の現状把握', criteria: 'どのような場所（データ、競合、お客様の声）を見て把握すればいいか、どの数値が大事か（KPI）を説明できる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't6', month: '5月', grade: 'J1', category: 'I. 基礎・ルーティン業務', item: 'クーポン発行', criteria: 'クーポンの種類、設定方法、費用対効果の基本を理解し、発行作業ができる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't7', month: '5月', grade: 'J1', category: 'I. 基礎・ルーティン業務', item: 'SSサーチ対応', criteria: '検索順位ロジックの基本を理解し、対応作業ができる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't8', month: '6月', grade: 'J1', category: 'II. 販売の基本思考', item: '業務の優先順位', criteria: '売り上げ、粗利率、スピード感、影響範囲を考慮した優先順位のロジックを説明できる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't9', month: '6月', grade: 'J1', category: 'II. 販売の基本思考', item: 'レビュー返信', criteria: '記入したお客様だけでなく、今後購入検討している人やインフルエンサーへの影響を考慮した返信を作成できる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't10', month: '6月', grade: 'J1', category: 'III. 利益と戦略', item: '画像依頼（J1）', criteria: '「売れる画像とは何か（誰に・何を・どう売るか）」を説明し、依頼に必要な情報（意図）を伝える簡単な指示書を作成できる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't11', month: '6月', grade: 'J1', category: 'I. 基礎・ルーティン業務', item: 'タイトル更新', criteria: 'SEO（検索順位最適化）を意識したタイトル設定のルールと重要性を理解し、作業ができる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't12', month: '6月', grade: 'J1', category: 'I. 基礎・ルーティン業務', item: 'セール時の特集更新', criteria: 'セール構造と特集ページへの導線設計の意図を理解し、更新作業ができる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't13', month: '7月', grade: 'J2', category: 'IV. 実践・成果創出', item: '★販売計画', criteria: '販売計画書の構成要素と、なぜそれが必要かを説明し、3カ月分の簡易計画書を作成できる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't14', month: '7月', grade: 'J2', category: 'IV. 実践・成果創出', item: '[J2-A] 転換率改善 (立案)', criteria: '転換率改善施策を2商品で立案し、目標数値設定（1%以上アップ）までを完了する。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't15', month: '7月', grade: 'J1', category: 'I. 基礎・ルーティン業務', item: 'SPバナー更新', criteria: 'バナー配置の意図（訴求優先度）を理解し、更新作業ができる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't16', month: '8月', grade: 'J2', category: 'IV. 実践・成果創出', item: '[J2-A] 転換率改善 (実行)', criteria: '[J2-A] の施策を実行し、達成（転換率1%以上アップ）までを完了する。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't17', month: '8月', grade: 'J2', category: 'IV. 実践・成果創出', item: '[J2-B] 粗利率改善 (立案)', criteria: '粗利率改善施策を2商品で立案し、目標数値設定（売上を落とさず1%以上アップ）までを完了する。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't18', month: '9月', grade: 'J2', category: 'IV. 実践・成果創出', item: '[J2-B] 粗利率改善 (実行)', criteria: '[J2-B] の施策を実行し、達成（売上を落とさず粗利率1%以上アップ）までを完了する。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't19', month: '9月', grade: 'J2', category: 'IV. 実践・成果創出', item: '商品改善提案（J2）', criteria: 'データに基づき、市場/競合を考慮した商品改善提案（機能/パッケージなど）を2商品分作成し、上長承認までを得る。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't20', month: '10月', grade: 'J2', category: 'IV. 実践・成果創出', item: '画像依頼：指示書作成 (30点)', criteria: '新商品・フルリメイク・一部リメイクを含む30点分の画像依頼指示書作成から上長承認を経て、依頼を完了する一連の業務を自立して行える。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't21', month: '11月', grade: 'J2', category: 'III. 利益と戦略', item: '広告運用：RPP DEAL', criteria: 'RPP、DEALの仕組み、予算設定、調整、停止の基本的な運用作業と、効果測定の基本ができる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't22', month: '11月', grade: 'J2', category: 'III. 利益と戦略', item: 'SNSを活用した売り方', criteria: '販促におけるSNSの役割と基本的な活用方法（ターゲット、コンテンツ、成果）を説明できる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+        
+            { id: 't23', month: '12月', grade: 'J2', category: 'II. 販売の基本思考', item: 'PDCAの回し方', criteria: '施策や画像に具体的な目的とKGI/KPIを設定し、論理的な振り返りを行い、次施策につなげられる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't24', month: '12月', grade: 'J2', category: 'II. 販売の基本思考', item: '生産性向上', criteria: '効率化のアイデアを2つ以上提案し、1つは実現（トライアル）まで行える。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't25', month: '翌1月', grade: 'J2', category: 'IV. 実践・成果創出', item: '転換率改善（応用）', criteria: '難易度の高い商品（例：競合が多いカテゴリ）を選定し、再度転換率1%アップの施策を立案・実行し、結果を出せる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't26', month: '翌2月', grade: 'J2', category: 'IV. 実践・成果創出', item: '粗利率改善（応用）', criteria: '利益構造の深い理解に基づき、再度粗利率1%アップの施策を立案・実行し、結果を出せる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't27', month: '翌3月', grade: 'J2', category: 'I. 基礎・ルーティン業務', item: '各種ツールの使用', criteria: '他部署連携時に使うツールの全種類と、それぞれのツールの役割、及び使用範囲を理解し、必要な業務を完遂できる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't28', month: '翌3月', grade: 'J2', category: 'J3準備', item: 'J3到達度チェック', criteria: 'J2の全項目について、指導なしで自立して実行できることを上長と確認し、J3への準備が整っていることを確認する。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't29', month: '翌4月', grade: 'J3', category: 'V. 事業貢献・開発', item: '画像依頼（J3）', criteria: 'クリエイティブディレクションの意図を理解し、複数商品にまたがるプロジェクトを含む30点分の依頼指示書を自立して作成、完了できる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't30', month: '翌4月', grade: 'J3', category: 'V. 事業貢献・開発', item: '[J3-A] 転換率改善 (カテゴリ)', criteria: '担当カテゴリ全体のアクセスと転換率を分析し、年間計画に組み込むレベルの改善施策を立案・実行し、結果を出せる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't31', month: '翌5月', grade: 'J3', category: 'V. 事業貢献・開発', item: '[J3-B] 粗利率改善 (仕入れ含む)', criteria: '利益構造の深い理解に基づき、仕入れや販管費削減に繋がる提案を含む粗利率改善施策を立案・実行し、結果を出せる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't32', month: '翌6月', grade: 'J3', category: 'V. 事業貢献・開発', item: '商品改善（J3）', criteria: '商品改善提案、承認後、発注まで（3カ月以内）の一連のプロセスを主担当として2商品分推進できる。', checkedA: false, dateA: '', checkedB: false, dateB: '' },
+            { id: 't33', month: '翌6月', grade: 'J3', category: '最終目標', item: 'J3昇格', criteria: 'J3の全項目を達成し、担当カテゴリ/ブランドの売上・利益に定常的に貢献できることを証明する。', checkedA: false, dateA: '', checkedB: false, dateB: '' }
+        ];
+
+        let currentView = 'roadmap';
+        let currentTab = 'j1';
+        let charts = {};
+
+        function showView(viewId) {
+            document.querySelectorAll('[data-view]').forEach(view => {
+                view.classList.remove('active');
+            });
+            document.getElementById(`view-${viewId}`).classList.add('active');
+
+            document.querySelectorAll('.nav-link').forEach(link => {
+                link.classList.remove('active');
+            });
+            document.getElementById(`nav-${viewId}`).classList.add('active');
+            currentView = viewId;
+        }
+
+        function showTab(tabId) {
+            document.querySelectorAll('[data-tab-content]').forEach(content => {
+                content.classList.remove('active');
+            });
+            document.getElementById(`tab-${tabId}`).classList.add('active');
+
+            document.querySelectorAll('.tab-link').forEach(link => {
+                link.classList.remove('active');
+            });
+            event.target.classList.add('active');
+            currentTab = tabId;
+        }
+
+        window.populateTaskTable = function() {
+            const tbody = document.getElementById('task-table-body');
+            tbody.innerHTML = '';
+            let lastMonth = '';
+            
+            window.allTasks.forEach(task => {
+                const tr = document.createElement('tr');
+                tr.className = 'bg-white border-b hover:bg-stone-50';
+
+                let monthCell = '';
+                if (task.month !== lastMonth) {
+                    monthCell = `<td class="px-4 py-4 font-semibold">${task.month}</td>`;
+                    lastMonth = task.month;
+                } else {
+                    monthCell = `<td class="px-4 py-4"></td>`;
+                }
+
+                let gradeColor = 'text-stone-700';
+                if (task.grade === 'J1') gradeColor = 'text-green-700 font-semibold';
+                if (task.grade === 'J2') gradeColor = 'text-yellow-700 font-semibold';
+                if (task.grade === 'J3') gradeColor = 'text-red-700 font-semibold';
+
+                tr.innerHTML = `
+                    ${monthCell}
+                    <td class="px-4 py-4 ${gradeColor}">${task.grade}</td>
+                    <td class="px-4 py-4 text-xs">${task.category}</td>
+                    <td class="px-4 py-4 font-medium">${task.item}</td>
+                    <td class="px-4 py-4">${task.criteria.replace(/\n/g, '<br>')}</td>
+                    <td class="px-4 py-4 text-center">
+                        <input type="checkbox" class="form-checkbox h-5 w-5 text-blue-600 rounded" onchange="updateProgress('${task.id}', 'A', this.checked)" ${task.checkedA ? 'checked' : ''}>
+                    </td>
+                    <td class="px-4 py-4">
+                        <input type="date" class="form-input text-xs p-1 border rounded w-32" onchange="updateDate('${task.id}', 'A', this.value)" value="${task.dateA || ''}">
+                    </td>
+                    <td class="px-4 py-4 text-center">
+                        <input type="checkbox" class="form-checkbox h-5 w-5 text-blue-600 rounded" onchange="updateProgress('${task.id}', 'B', this.checked)" ${task.checkedB ? 'checked' : ''}>
+                    </td>
+                    <td class="px-4 py-4">
+                        <input type="date" class="form-input text-xs p-1 border rounded w-32" onchange="updateDate('${task.id}', 'B', this.value)" value="${task.dateB || ''}">
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+        
+        function updateProgress(taskId, employee, isChecked) {
+            const task = window.allTasks.find(t => t.id === taskId);
+            if (!task) return;
+
+            let key, dateKey;
+            if (employee === 'A') {
+                key = 'checkedA';
+                dateKey = 'dateA';
+            } else if (employee === 'B') {
+                key = 'checkedB';
+                dateKey = 'dateB';
+            }
+
+            // ローカルのallTasksを更新 (Firestoreからの反映ラグを抑えるため)
+            task[key] = isChecked;
+            if (!isChecked) task[dateKey] = '';
+
+            // Firestoreに保存
+            const updates = { [key]: isChecked };
+            if (!isChecked) { updates[dateKey] = ''; }
+            window.saveTaskProgress(taskId, employee, key, updates);
+
+            window.populateTaskTable();
+            window.renderProgressCharts();
+        }
+
+        function updateDate(taskId, employee, date) {
+            const task = window.allTasks.find(t => t.id === taskId);
+            if (!task) return;
+
+            let key = employee === 'A' ? 'dateA' : 'dateB';
+            let checkedKey = employee === 'A' ? 'checkedA' : 'checkedB';
+
+            // ローカルのallTasksを更新
+            task[key] = date;
+            if (date) task[checkedKey] = true;
+
+            // Firestoreに保存
+            const updates = { [key]: date };
+            if (date) { updates[checkedKey] = true; }
+            window.saveTaskProgress(taskId, employee, key, updates);
+
+            window.populateTaskTable();
+            window.renderProgressCharts();
+        }
+
+        function getProgressData(employee) {
+            const total = window.allTasks.length;
+            const completed = window.allTasks.filter(t => employee === 'A' ? t.checkedA : t.checkedB).length;
+            const incomplete = total - completed;
+            
+            const grades = ['J1', 'J2', 'J3'];
+            const progressByGrade = grades.map(grade => {
+                const gradeTasks = window.allTasks.filter(t => t.grade === grade);
+                const gradeTotal = gradeTasks.length;
+                const gradeCompleted = gradeTasks.filter(t => employee === 'A' ? t.checkedA : t.checkedB).length;
+                return gradeTotal > 0 ? (gradeCompleted / gradeTotal) * 100 : 0;
+            });
+
+            return {
+                overall: { completed, incomplete },
+                byGrade: { labels: grades, data: progressByGrade }
+            };
+        }
+
+        window.renderProgressCharts = function() {
+            const dataA = getProgressData('A');
+            const dataB = getProgressData('B');
+
+            renderDonutChart('progressChartA', dataA.overall);
+            renderDonutChart('progressChartB', dataB.overall);
+            renderBarChart('progressByGradeA', dataA.byGrade);
+            renderBarChart('progressByGradeB', dataB.byGrade);
+        }
+        
+        function renderDonutChart(canvasId, data) {
+            const ctx = document.getElementById(canvasId).getContext('2d');
+            if (charts[canvasId]) {
+                charts[canvasId].destroy();
+            }
+            charts[canvasId] = new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: ['達成済み', '未達成'],
+                    datasets: [{
+                        data: [data.completed, data.incomplete],
+                        backgroundColor: ['#1d4ed8', '#e5e7eb'],
+                        borderColor: '#ffffff',
+                        borderWidth: 2
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    cutout: '70%',
+                    plugins: {
+                        legend: {
+                            position: 'bottom',
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    let label = context.label || '';
+                                    if (label) {
+                                        label += ': ';
+                                    }
+                                    if (context.parsed !== null) {
+                                        label += context.parsed + '件';
+                                    }
+                                    return label;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function renderBarChart(canvasId, data) {
+            const ctx = document.getElementById(canvasId).getContext('2d');
+            if (charts[canvasId]) {
+                charts[canvasId].destroy();
+            }
+            charts[canvasId] = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: data.labels,
+                    datasets: [{
+                        label: '達成率 (%)',
+                        data: data.data,
+                        backgroundColor: ['#22c55e', '#eab308', '#ef4444'],
+                        borderRadius: 4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    indexAxis: 'y',
+                    scales: {
+                        x: {
+                            beginAtZero: true,
+                            max: 100,
+                            ticks: {
+                                callback: value => value + '%'
+                            }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            display: false
+                        }
+                    }
+                }
+            });
+        }
+
+        function getSkillData(grade) {
+            const tasks = window.allTasks.filter(t => t.grade === grade);
+            const categories = [...new Set(tasks.map(t => t.category))];
+            const data = categories.map(cat => {
+                return tasks.filter(t => t.category === cat).length;
+            });
+            return { labels: categories, data };
+        }
+
+        function populateSkillLists() {
+            const lists = {
+                J1: document.getElementById('skillListJ1'),
+                J2: document.getElementById('skillListJ2'),
+                J3: document.getElementById('skillListJ3')
+            };
+            
+            ['J1', 'J2', 'J3'].forEach(grade => {
+                lists[grade].innerHTML = '';
+                window.allTasks.filter(t => t.grade === grade).forEach(task => {
+                    const li = document.createElement('li');
+                    li.className = 'border-b pb-3';
+                    li.innerHTML = `
+                        <span class="block text-xs text-stone-500">${task.category}</span>
+                        <strong class="block font-semibold text-stone-700">${task.item}</strong>
+                        <p class="text-sm text-stone-600">${task.criteria}</p>
+                    `;
+                    lists[grade].appendChild(li);
+                });
+            });
+        }
+
+        function renderSkillCharts() {
+            const dataJ1 = getSkillData('J1');
+            const dataJ2 = getSkillData('J2');
+            const dataJ3 = getSkillData('J3');
+
+            renderRadarChart('skillRadarJ1', dataJ1, '#22c55e');
+            renderRadarChart('skillRadarJ2', dataJ2, '#eab308');
+            renderRadarChart('skillRadarJ3', dataJ3, '#ef4444');
+        }
+
+        function renderRadarChart(canvasId, data, color) {
+            const ctx = document.getElementById(canvasId).getContext('2d');
+            if (charts[canvasId]) {
+                charts[canvasId].destroy();
+            }
+            charts[canvasId] = new Chart(ctx, {
+                type: 'radar',
+                data: {
+                    labels: data.labels.map(l => l.split(' ').pop()),
+                    datasets: [{
+                        label: '項目数',
+                        data: data.data,
+                        backgroundColor: color + '33',
+                        borderColor: color,
+                        borderWidth: 2,
+                        pointBackgroundColor: color,
+                        pointBorderColor: '#fff',
+                        pointHoverBackgroundColor: '#fff',
+                        pointHoverBorderColor: color
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        r: {
+                            beginAtZero: true,
+                            ticks: {
+                                stepSize: 1
+                            }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            display: false
+                        }
+                    }
+                }
+            });
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            // Firebaseの読み込みと認証は<script type="module">ブロックで行われます。
+            // 認証が完了次第、loadTasks()が実行され、UIが初期化されます。
+            populateSkillLists();
+            renderSkillCharts();
+        });
+
+    </script>
+</body>
+</html>
